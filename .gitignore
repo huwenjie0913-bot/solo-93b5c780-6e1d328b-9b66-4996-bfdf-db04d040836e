@@ -1,0 +1,6 @@
+data/
+*.db
+.pylibs/
+__pycache__/
+.pytest_cache/
+*.pyc

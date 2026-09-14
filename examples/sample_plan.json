@@ -1,0 +1,25 @@
+{
+  "name": "2026-09-A批次-8S1P",
+  "rated_capacity_ah": 105.0,
+  "topology": "8S1P",
+  "thresholds": {
+    "capacity_cv_max": 0.03,
+    "resistance_cv_max": 0.08,
+    "temperature_delta_max": 5.0,
+    "ocv_delta_max": 0.05,
+    "soh_min": 0.80
+  },
+  "cells": [
+    {"cell_id": "A-0001", "capacity_ah": 100.2, "resistance_mohm": 2.01, "ocv_v": 3.205, "cycles": 620, "temperature_c": 25.1},
+    {"cell_id": "A-0002", "capacity_ah": 100.5, "resistance_mohm": 1.98, "ocv_v": 3.206, "cycles": 610, "temperature_c": 25.0},
+    {"cell_id": "A-0003", "capacity_ah": 99.8,  "resistance_mohm": 2.05, "ocv_v": 3.198, "cycles": 650, "temperature_c": 25.2},
+    {"cell_id": "A-0004", "capacity_ah": 100.1, "resistance_mohm": 2.02, "ocv_v": 3.201, "cycles": 635, "temperature_c": 25.0},
+    {"cell_id": "A-0005", "capacity_ah": 100.3, "resistance_mohm": 2.00, "ocv_v": 3.204, "cycles": 615, "temperature_c": 25.1},
+    {"cell_id": "A-0006", "capacity_ah": 99.9,  "resistance_mohm": 2.04, "ocv_v": 3.200, "cycles": 640, "temperature_c": 25.3},
+    {"cell_id": "A-0007", "capacity_ah": 100.4, "resistance_mohm": 1.99, "ocv_v": 3.207, "cycles": 605, "temperature_c": 25.0},
+    {"cell_id": "A-0008", "capacity_ah": 100.0, "resistance_mohm": 2.03, "ocv_v": 3.202, "cycles": 645, "temperature_c": 25.2},
+    {"cell_id": "A-0009", "capacity_ah": 100.6, "resistance_mohm": 1.97, "ocv_v": 3.208, "cycles": 598, "temperature_c": 25.1},
+    {"cell_id": "A-0010", "capacity_ah": 99.7,  "resistance_mohm": 2.06, "ocv_v": 3.197, "cycles": 660, "temperature_c": 25.0},
+    {"cell_id": "A-0011", "capacity_ah": 85.2,  "resistance_mohm": 3.60, "ocv_v": 3.105, "cycles": 1500, "temperature_c": 25.4}
+  ]
+}
