@@ -43,44 +43,110 @@ def _percentile(values: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (pos - lo)
 
 
-def _position_balance(caps: list[float], resistances: list[float], s: int, p: int) -> dict:
-    """模拟 p 并 × s 串布局，估算 SOC 不均。
+def _arrange_parallel_strings(
+    members: list[dict], s: int, p: int
+) -> list[dict[str, Any]]:
+    """把电芯分配到 s 个并联串（每串至多 p 只），尽量拉平各串容量。
 
-    每串由容量 CV 最大的 p 只电芯组合而成（对 SOC 最不利的近似），
-    以各串容量极差 / 均值串容量作为 SOC 不均衡估计。
+    采用 LPT（longest-processing-time）贪心：容量从大到小，逐只放入
+    当前容量和最小且未满的串，使最弱串（决定整包可用容量）尽量大。
+    同容量时按电芯编号打破平局，保证结果确定。
     """
-    group_size = s * p
-    if p == 1 or group_size != len(caps):
-        return {"estimated_soc_imbalance_pct": 0.0, "method": "none"}
+    strings: list[dict[str, Any]] = [
+        {"string_no": k + 1, "cells": [], "capacity_ah": 0.0,
+         "conductance": 0.0}
+        for k in range(s)
+    ]
+    for cell in sorted(members, key=lambda c: (-c["capacity_ah"], c["cell_id"])):
+        idx = min(
+            (k for k in range(s) if len(strings[k]["cells"]) < p),
+            key=lambda k: (strings[k]["capacity_ah"], k),
+        )
+        bucket = strings[idx]
+        bucket["cells"].append(cell)
+        bucket["capacity_ah"] += cell["capacity_ah"]
+        bucket["conductance"] += 1.0 / cell["resistance_mohm"]
+    return strings
 
-    order = sorted(range(len(caps)), key=lambda i: caps[i])
-    # 容量最分散的 p 只组成一串：最小与最大交替搭配以形成最不利串
-    picked: list[int] = []
-    lo, hi = 0, len(order) - 1
-    take_low = True
-    for _ in range(min(p, len(order))):
-        picked.append(order[lo if take_low else hi])
-        if take_low:
-            lo += 1
-        else:
-            hi -= 1
-        take_low = not take_low
 
-    string_caps = [min(caps[i] for i in picked)]
-    remaining = [i for i in order if i not in set(picked)]
-    # 其余电芯按容量升序每 p 只成串（容量近似相等，串容量≈最小）
-    for k in range(0, len(remaining), p):
-        chunk = remaining[k : k + p]
-        if len(chunk) == p:
-            string_caps.append(min(caps[i] for i in chunk))
+def _string_view(strings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """对外的并联串明细（含容量和与并联内阻）。"""
+    view = []
+    for b in strings:
+        resistance = (1.0 / b["conductance"]) if b["conductance"] else None
+        view.append({
+            "string_no": b["string_no"],
+            "cell_ids": [c["cell_id"] for c in b["cells"]],
+            "cell_count": len(b["cells"]),
+            "capacity_ah": round(b["capacity_ah"], 4),
+            "resistance_mohm": round(resistance, 6) if resistance is not None else None,
+        })
+    return view
 
-    if len(string_caps) < 2:
-        return {"estimated_soc_imbalance_pct": 0.0, "method": "worst-case-string"}
-    mu = mean(string_caps)
-    imbalance = (max(string_caps) - min(string_caps)) / mu if mu else 0.0
+
+def _pack_layout(members: list[dict], topology: dict[str, Any]) -> dict[str, Any]:
+    """按串并联拓扑计算成包容量/内阻。
+
+    - 每只并联串容量 = 串内 p 只电芯容量之和，内阻 = p 只内阻并联；
+    - s 串串联，整包可用容量受最弱串限制（串联回路各串放出的容量一致）；
+    - 整包内阻 = 各串内阻之和；
+    - 组未满配时无法构成完整拓扑，退回“最弱单体 + 均值估算”的保守口径。
+    """
+    s, p = topology["series"], topology["parallel"]
+    group_size = topology["group_size"]
+    n = len(members)
+
+    # 尾料池电芯数可能超过一组：无法布成 s*p，按未成包保守口径处理
+    if n > group_size:
+        return {
+            "usable_capacity_ah": round(min(c["capacity_ah"] for c in members), 4),
+            "pack_resistance_mohm": round(mean([c["resistance_mohm"] for c in members])
+                                          / p * s, 6),
+            "parallel_strings": [],
+            "weakest_string_no": None,
+            "string_capacity_cv": None,
+            "string_imbalance_pct": 0.0,
+            "method": "unassigned_pool",
+        }
+
+    strings = _arrange_parallel_strings(members, s, p)
+    complete = n == group_size
+
+    if complete:
+        sums = [b["capacity_ah"] for b in strings]
+        weakest_no = min(range(s), key=lambda k: (sums[k], k)) + 1
+        # 串联：各串放出容量一致，整包容量 = 最弱串容量
+        usable = min(sums)
+        # 各串并联后再串联：内阻相加
+        pack_resistance = sum(1.0 / b["conductance"] for b in strings)
+        mu = mean(sums)
+        imbalance = (max(sums) - min(sums)) / mu if mu else 0.0
+        return {
+            "usable_capacity_ah": round(usable, 4),
+            "pack_resistance_mohm": round(pack_resistance, 6),
+            "parallel_strings": _string_view(strings),
+            "weakest_string_no": weakest_no,
+            "string_capacity_cv": round(cv(sums), 6),
+            "string_imbalance_pct": round(imbalance * 100, 4),
+            "method": "min_parallel_string",
+        }
+
+    # 未满配：保守按最弱单体给可用容量，内阻按组均值做拓扑估算
+    nonempty = [b for b in strings if b["cells"]]
+    sums = [b["capacity_ah"] for b in nonempty]
+    imbalance = 0.0
+    if p > 1 and sums:
+        mu = mean(sums)
+        imbalance = (max(sums) - min(sums)) / mu if mu else 0.0
     return {
-        "estimated_soc_imbalance_pct": round(imbalance * 100, 4),
-        "method": "worst-case-string",
+        "usable_capacity_ah": round(min(c["capacity_ah"] for c in members), 4),
+        "pack_resistance_mohm": round(
+            mean([c["resistance_mohm"] for c in members]) / p * s, 6),
+        "parallel_strings": _string_view(strings),
+        "weakest_string_no": None,
+        "string_capacity_cv": round(cv(sums), 6) if sums else None,
+        "string_imbalance_pct": round(imbalance * 100, 4),
+        "method": "cell_min_shortfall",
     }
 
 
@@ -159,10 +225,7 @@ def evaluate_group(
     ocv_delta = max(ocvs) - min(ocvs)
     temp_delta = max(temps) - min(temps)
 
-    # 短板原则：并联串容量取组内最小，整包可用容量 = 最小串容量
-    usable_capacity_ah = round(cap_min, 4)
-    pack_voltage_v = round(min(ocvs) * s, 4)  # 保守估计：按最低单体 × 串联数
-    pack_resistance_mohm = round((res_mu / p) * s, 6)
+    cap_cv_excess = cap_cv - thresholds["capacity_cv_max"]
 
     weakest = min(
         members,
@@ -170,13 +233,16 @@ def evaluate_group(
     )
     deficit_pct = round((cap_mu - weakest["capacity_ah"]) / cap_mu * 100, 4) if cap_mu else 0.0
 
-    pos = _position_balance(caps, ress, s, p)
+    # 按串并联拓扑计算成包可用容量/内阻与各并联串明细
+    layout = _pack_layout(members, topology)
+    usable_capacity_ah = layout["usable_capacity_ah"]
+    pack_resistance_mohm = layout["pack_resistance_mohm"]
+    pack_voltage_v = round(min(ocvs) * s, 4)  # 保守估计：按最低单体 × 串联数
 
     # ---- 风险评分（0-100，分段累计并截断） ----
     reasons: list[dict[str, Any]] = []
     score = 0.0
 
-    cap_cv_excess = cap_cv - thresholds["capacity_cv_max"]
     if cap_cv_excess > 0:
         add = min(40.0, 10.0 + cap_cv_excess / max(thresholds["capacity_cv_max"], 1e-9) * 30.0)
         score += add
@@ -233,12 +299,14 @@ def evaluate_group(
             "threshold": thresholds["soh_min"],
         })
 
-    if pos["estimated_soc_imbalance_pct"] > 5.0:
-        score += min(10.0, pos["estimated_soc_imbalance_pct"])
+    if p > 1 and layout["method"] == "min_parallel_string" \
+            and layout["string_imbalance_pct"] > 5.0:
+        score += min(10.0, layout["string_imbalance_pct"])
         reasons.append({
-            "code": "POSITION_IMBALANCE",
-            "message": f"串位置估算 SOC 不均衡 {pos['estimated_soc_imbalance_pct']:.2f}% 偏高",
-            "measured": pos["estimated_soc_imbalance_pct"],
+            "code": "STRING_IMBALANCE",
+            "message": f"并联串间容量不均衡 {layout['string_imbalance_pct']:.2f}% 偏高"
+                       f"（最弱串 #{layout['weakest_string_no']} 决定整包可用容量）",
+            "measured": layout["string_imbalance_pct"],
             "threshold": 5.0,
         })
 
@@ -306,9 +374,15 @@ def evaluate_group(
             "temperature_delta_c": round(temp_delta, 4),
             "min_soh": round(min_soh, 4),
             "usable_capacity_ah": usable_capacity_ah,
+            "usable_capacity_method": layout["method"],
             "estimated_pack_voltage_v": pack_voltage_v,
             "estimated_pack_resistance_mohm": pack_resistance_mohm,
-            **pos,
+            "weakest_string_no": layout["weakest_string_no"],
+            "parallel_strings": layout["parallel_strings"],
+            "string_capacity_cv": layout["string_capacity_cv"],
+            "string_imbalance_pct": layout["string_imbalance_pct"],
+            # 兼容旧字段名
+            "estimated_soc_imbalance_pct": layout["string_imbalance_pct"],
         },
         "weakest_cell": {
             "cell_id": weakest["cell_id"],

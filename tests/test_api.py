@@ -153,6 +153,24 @@ def test_get_version_export_and_404(client):
     assert client.get(f"/api/v1/plans/{plan_id}/diff?from=1&to=99").status_code == 404
 
 
+def test_parallel_topology_usable_capacity_api(client):
+    """回归：4S2P、8 只 100Ah 电芯经完整 API 链路必须返回 200Ah。"""
+    body = copy.deepcopy(GOOD_BODY)
+    body["topology"] = "4S2P"
+    body["cells"] = make_cells(8, base_cap=100.0, spread=0.0)
+    resp = client.post("/api/v1/plans", json=body)
+    assert resp.status_code == 201, resp.get_json()
+    metrics = resp.get_json()["result"]["groups"][0]["metrics"]
+    assert metrics["usable_capacity_ah"] == 200.0
+    assert metrics["usable_capacity_method"] == "min_parallel_string"
+    assert len(metrics["parallel_strings"]) == 4
+    assert all(st["capacity_ah"] == 200.0 for st in metrics["parallel_strings"])
+    # 保存后重新读取（版本持久化）结果一致
+    plan_id = resp.get_json()["plan_id"]
+    reloaded = client.get(f"/api/v1/plans/{plan_id}/versions/1").get_json()
+    assert reloaded["result"]["groups"][0]["metrics"]["usable_capacity_ah"] == 200.0
+
+
 def test_cell_archive_persisted(client):
     client.post("/api/v1/plans", json=GOOD_BODY)
     resp = client.get("/api/v1/cells/C001")
