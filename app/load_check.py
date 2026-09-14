@@ -116,8 +116,10 @@ def _check_group(
             }
 
     # 可承受峰值电流：同时满足电压与损耗约束的最小电流
+    # 下限高于开路电压时，即使 I=0（端电压=开路电压）也达不到下限，
+    # 电压侧可承受峰值为 0，而不是负值。
     if resistance_ohm > 0:
-        peak_by_voltage = (ocv_v - min_terminal_v) / resistance_ohm
+        peak_by_voltage = max(0.0, (ocv_v - min_terminal_v) / resistance_ohm)
         peak_by_power = (max_loss_power_w / resistance_ohm) ** 0.5
     else:
         # 内阻为 0 时内阻不构成压降/损耗，约束无意义

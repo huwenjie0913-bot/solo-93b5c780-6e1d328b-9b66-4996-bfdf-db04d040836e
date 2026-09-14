@@ -302,6 +302,66 @@ def test_zero_current_allowed(client):
     assert s["violated"] is False
 
 
+def test_voltage_limit_above_ocv_gives_zero_peak_current(client):
+    """边界：电压下限 30V 高于整包开路电压 25.6V 时，峰值电流必须是 0A 而非负值。
+
+    即使 I=0（端电压=开路电压）也达不到下限，首个越限点与
+    UNDER_MIN_TERMINAL_VOLTAGE 原因仍需保留。
+    """
+    plan_id = _create(client)
+    body = {
+        "steps": [{"current_a": 50.0, "duration_s": 10.0}],
+        "min_terminal_voltage_v": 30.0,
+        "max_loss_power_w": 100000.0,
+    }
+    resp = _check(client, plan_id, 1, body)
+    assert resp.status_code == 200, resp.get_json()
+    lc = resp.get_json()["load_check"]
+
+    for g in lc["groups"]:
+        assert g["sustainable_peak_current_a"] == 0.0
+        assert g["peak_current_limited_by"] == "UNDER_MIN_TERMINAL_VOLTAGE"
+        assert g["passed"] is False
+
+    assert lc["peak_current_a"] == 0.0
+    assert lc["peak_current_limited_by"] == "UNDER_MIN_TERMINAL_VOLTAGE"
+    assert lc["all_groups_passed"] is False
+    assert lc["weakest_group"]["sustainable_peak_current_a"] == 0.0
+
+    fv = lc["first_violation"]
+    assert fv["step_no"] == 1
+    assert {r["code"] for r in fv["reasons"]} == {"UNDER_MIN_TERMINAL_VOLTAGE"}
+    # I=0 时端电压本就只有 25.6V；50A 下还要再降 0.807V
+    measured = fv["reasons"][0]["measured"]
+    assert measured == pytest.approx(25.6 - 50 * 0.01614, abs=1e-3)
+    assert fv["reasons"][0]["threshold"] == 30.0
+
+
+def test_zero_current_step_violates_when_limit_above_ocv(client):
+    """零电流静置步骤在 OCV 本身低于下限时也应判越限，且峰值电流为 0A。"""
+    plan_id = _create(client)
+    body = {
+        "steps": [{"current_a": 0.0, "duration_s": 60.0}],
+        "min_terminal_voltage_v": 30.0,
+        "max_loss_power_w": 100000.0,
+    }
+    resp = _check(client, plan_id, 1, body)
+    assert resp.status_code == 200, resp.get_json()
+    lc = resp.get_json()["load_check"]
+
+    g1 = lc["groups"][0]
+    s1 = g1["steps"][0]
+    assert s1["voltage_drop_v"] == 0.0
+    assert s1["terminal_voltage_v"] == pytest.approx(25.6, abs=1e-3)
+    assert s1["violated"] is True
+    assert {r["code"] for r in s1["violations"]} == {"UNDER_MIN_TERMINAL_VOLTAGE"}
+    assert g1["first_violation"]["step_no"] == 1
+    assert g1["sustainable_peak_current_a"] == 0.0
+    assert g1["passed"] is False
+    assert lc["first_violation"]["step_no"] == 1
+    assert lc["all_groups_passed"] is False
+
+
 def test_plan_and_version_not_found(client):
     body = {"steps": [{"current_a": 10.0, "duration_s": 1.0}],
             "min_terminal_voltage_v": 24.0, "max_loss_power_w": 1000.0}
