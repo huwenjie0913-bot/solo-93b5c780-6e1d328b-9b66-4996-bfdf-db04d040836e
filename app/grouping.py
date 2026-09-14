@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 from .validation import DEFAULT_THRESHOLDS
+from .screening import QUARANTINE, RETEST
 
 
 def mean(values: list[float]) -> float:
@@ -210,6 +211,8 @@ def evaluate_group(
     """评估一个已成型的组。members 为该组电芯，leftovers 为所有未入组电芯。
 
     forced_reason: 尾料池等“非真实成包组”强制附带的风险原因 code。
+    成员上的可选键 ``screening`` 为该电芯最新静置复测结论
+    （``{"verdict", "batch_id", ...}``，未筛查为 None）。
     """
     s, p, group_size = topology["series"], topology["parallel"], topology["group_size"]
     caps = [c["capacity_ah"] for c in members]
@@ -330,6 +333,35 @@ def evaluate_group(
             "threshold": group_size,
         })
 
+    # ---- 静置复测组级风险：待复测电芯默认允许成包但记入组风险 ----
+    retest_members = [c for c in members
+                      if (c.get("screening") or {}).get("verdict") == RETEST]
+    if retest_members:
+        score += min(20.0, 6.0 * len(retest_members))
+        ids = "、".join(c["cell_id"] for c in retest_members)
+        reasons.append({
+            "code": "SCREENING_RETEST_PENDING",
+            "message": f"{len(retest_members)} 只电芯静置复测结论为待复测，"
+                       f"自放电尚未确认（{ids}），组级标记风险，需复测后复核",
+            "measured": len(retest_members),
+            "threshold": 0,
+            "cell_ids": [c["cell_id"] for c in retest_members],
+        })
+    quarantine_members = [c for c in members
+                          if (c.get("screening") or {}).get("verdict") == QUARANTINE]
+    if quarantine_members:
+        # 强制门禁关闭时（默认）隔离电芯不会进入成员；保留审计兜底
+        score = 100.0
+        ids = "、".join(c["cell_id"] for c in quarantine_members)
+        reasons.append({
+            "code": "SCREENING_QUARANTINED_CELL",
+            "message": f"{len(quarantine_members)} 只电芯静置复测结论为隔离，"
+                       f"疑似自放电/内短路异常（{ids}），禁止成包",
+            "measured": len(quarantine_members),
+            "threshold": 0,
+            "cell_ids": [c["cell_id"] for c in quarantine_members],
+        })
+
     score = round(min(100.0, score), 2)
     if not reasons:
         level = "LOW"
@@ -358,6 +390,7 @@ def evaluate_group(
                 "cycles": c["cycles"],
                 "temperature_c": c["temperature_c"],
                 "soh": c["soh"],
+                "screening": c.get("screening"),
             }
             for c in members
         ],
@@ -383,6 +416,8 @@ def evaluate_group(
             "string_imbalance_pct": layout["string_imbalance_pct"],
             # 兼容旧字段名
             "estimated_soc_imbalance_pct": layout["string_imbalance_pct"],
+            "screening_retest_count": len(retest_members),
+            "screening_quarantined_count": len(quarantine_members),
         },
         "weakest_cell": {
             "cell_id": weakest["cell_id"],
@@ -401,25 +436,103 @@ def evaluate_group(
     }
 
 
+def _apply_screening_gate(
+    cells: list[dict],
+    screening_map: dict[str, Any] | None,
+    enforce_screening: bool,
+) -> tuple[list[dict], dict[str, Any]]:
+    """应用静置复测门禁。
+
+    - 最新结论为 ``QUARANTINE``（隔离）：enforce 时直接拒绝，不进入装箱；
+      enforce=False（仅审计）时放行，但在 gating 中告警，组风险兜底隔离原因。
+    - 最新结论为 ``RETEST``（待复测）：允许装箱，由组级风险暴露。
+    - ``STABLE`` / 无筛查记录：正常处理（无记录在 gating.unscreened_cell_ids 留痕）。
+
+    screening_map 的 value 为 dict：{"verdict", "batch_id", "drop_rate_v_per_day",
+    "r_squared", "observation_hours", "verdict_label"}。
+    返回 (放行并附加 screening 键的电芯, gating 报告)。
+    """
+    screening_map = screening_map or {}
+    admitted: list[dict] = []
+    rejected_quarantine: list[dict[str, Any]] = []
+    warned_quarantine: list[dict[str, Any]] = []
+    retest_ids: list[str] = []
+    stable_ids: list[str] = []
+    unscreened_ids: list[str] = []
+    screened_ids: list[str] = []
+
+    for c in cells:
+        info = screening_map.get(c["cell_id"])
+        item = dict(c)
+        item["screening"] = info
+        if info is None:
+            unscreened_ids.append(c["cell_id"])
+            admitted.append(item)
+            continue
+        screened_ids.append(c["cell_id"])
+        verdict = info["verdict"]
+        if verdict == QUARANTINE:
+            if enforce_screening:
+                rejected_quarantine.append({
+                    "cell_id": c["cell_id"],
+                    "screening": info,
+                })
+            else:
+                warned_quarantine.append({
+                    "cell_id": c["cell_id"],
+                    "screening": info,
+                })
+                admitted.append(item)
+        elif verdict == RETEST:
+            retest_ids.append(c["cell_id"])
+            admitted.append(item)
+        else:
+            stable_ids.append(c["cell_id"])
+            admitted.append(item)
+
+    gating = {
+        "enforced": enforce_screening,
+        "screened_cell_ids": screened_ids,
+        "stable_cell_ids": stable_ids,
+        "retest_cell_ids": retest_ids,
+        "rejected_quarantined_cell_ids": [r["cell_id"] for r in rejected_quarantine],
+        "rejected_quarantined": rejected_quarantine,
+        "warned_quarantined_cell_ids": [r["cell_id"] for r in warned_quarantine],
+        "warned_quarantined": warned_quarantine,
+        "unscreened_cell_ids": unscreened_ids,
+        "rejected_count": len(rejected_quarantine),
+        "retest_count": len(retest_ids),
+        "unscreened_count": len(unscreened_ids),
+    }
+    return admitted, gating
+
+
 def build_groups(
     cells: list[dict],
     topology: dict[str, Any],
     thresholds: dict[str, float] | None = None,
     rated_capacity_ah: float | None = None,
+    screening_map: dict[str, Any] | None = None,
+    enforce_screening: bool = True,
 ) -> dict[str, Any]:
     """依据容量、内阻离散度进行贪心装箱，生成配组方案。
 
     流程：
-    1. 计算每只电芯 SOH（相对额定容量）；
-    2. 按容量升序、内阻升序排列；
-    3. 顺序开组，向当前组中加入不致 CV 越限且温度/OCV 可兼容的电芯；
-    4. 满配封组，剩余不足一只组的电芯进入尾料组。
+    1. 应用静置复测门禁：默认拒绝最新结论为隔离的电芯，待复测电芯放行；
+    2. 计算每只电芯 SOH（相对额定容量）；
+    3. 按容量升序、内阻升序排列；
+    4. 顺序开组，向当前组中加入不致 CV 越限且温度/OCV 可兼容的电芯；
+    5. 满配封组，剩余不足一只组的电芯进入尾料组。
     """
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     group_size = topology["group_size"]
 
+    gated_cells, gating = _apply_screening_gate(
+        cells, screening_map, enforce_screening
+    )
+
     enriched: list[dict] = []
-    for c in cells:
+    for c in gated_cells:
         item = dict(c)
         item["soh"] = round(c["capacity_ah"] / rated_capacity_ah, 4) if rated_capacity_ah else None
         enriched.append(item)
@@ -483,14 +596,23 @@ def build_groups(
     risk_scores = [g["risk"]["score"] for g in groups if g["complete"]]
     all_complete = groups and all(g["complete"] for g in groups)
 
-    weakest_overall = min(
-        enriched,
-        key=lambda c: (c["capacity_ah"], -(c["resistance_mohm"]), c["soh"] or 1),
-    )
-    cap_p10 = _percentile([c["capacity_ah"] for c in enriched], 0.10)
-    cap_p50 = _percentile([c["capacity_ah"] for c in enriched], 0.50)
+    if enriched:
+        weakest_overall = min(
+            enriched,
+            key=lambda c: (c["capacity_ah"], -(c["resistance_mohm"]), c["soh"] or 1),
+        )
+        weakest_id = weakest_overall["cell_id"]
+        cap_p10 = _percentile([c["capacity_ah"] for c in enriched], 0.10)
+        cap_p50 = _percentile([c["capacity_ah"] for c in enriched], 0.50)
+    else:
+        weakest_id = None
+        cap_p10 = cap_p50 = 0.0
 
+    retest_in_groups = sum(
+        g["metrics"]["screening_retest_count"] for g in groups if g["complete"]
+    )
     summary = {
+        "submitted_cells": len(cells),
         "total_cells": total_cells,
         "group_size": group_size,
         "complete_groups": len(complete_groups),
@@ -502,21 +624,25 @@ def build_groups(
         "overall_risk_level": (
             "CRITICAL" if not all_complete
             else ("HIGH" if max(risk_scores, default=0) >= 55
-                  else "MEDIUM" if max(risk_scores, default=0) >= 25
-                  else "LOW")
+                  else ("MEDIUM" if max(risk_scores, default=0) >= 25 else "LOW"))
         ),
         "usable_capacity_per_pack_ah": round(
             min((g["metrics"]["usable_capacity_ah"] for g in groups if g["complete"]),
                 default=0.0), 4),
-        "weakest_cell_id": weakest_overall["cell_id"],
+        "weakest_cell_id": weakest_id,
         "capacity_p10_ah": round(cap_p10, 4),
         "capacity_p50_ah": round(cap_p50, 4),
+        "screening_rejected_count": gating["rejected_count"],
+        "screening_retest_count": gating["retest_count"],
+        "screening_unscreened_count": gating["unscreened_count"],
+        "screening_retest_grouped_count": retest_in_groups,
     }
 
     return {
         "topology": topology,
         "thresholds": thresholds,
         "rated_capacity_ah": rated_capacity_ah,
+        "screening_gate": gating,
         "summary": summary,
         "groups": groups,
     }

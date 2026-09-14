@@ -10,7 +10,8 @@ from . import db as store
 from .diff import diff_results
 from .grouping import build_groups
 from .load_check import check_version_load
-from .validation import validate_load_check, validate_payload
+from .screening import VERDICT_LABELS, screen_cell, summarize
+from .validation import validate_load_check, validate_payload, validate_screening_payload
 
 bp = Blueprint("api", __name__, url_prefix="/api/v1")
 
@@ -59,6 +60,37 @@ def _validated(payload: dict) -> dict:
     return cleaned
 
 
+def _screening_map(conn, cells: list[dict]) -> dict[str, dict]:
+    """查询每只电芯最新筛查批次结论，供配组门禁使用。"""
+    rows = store.get_latest_screening_map(conn, [c["cell_id"] for c in cells])
+    mapping: dict[str, dict] = {}
+    for cell_id, row in rows.items():
+        mapping[cell_id] = {
+            "verdict": row["verdict"],
+            "verdict_label": VERDICT_LABELS.get(row["verdict"], row["verdict"]),
+            "batch_id": row["batch_id"],
+            "drop_rate_v_per_day": row["drop_rate_v_per_day"],
+            "slope_v_per_day": row["slope_v_per_day"],
+            "r_squared": row["r_squared"],
+            "observation_hours": row["observation_hours"],
+            "used_sample_count": row["used_sample_count"],
+            "sample_count": row["sample_count"],
+            "screened_at": row["created_at"],
+        }
+    return mapping
+
+
+def _enforce_flag(payload: dict) -> tuple[bool, list[dict]]:
+    """解析可选布尔字段 enforce_screening（默认开启隔离门禁）。"""
+    if "enforce_screening" not in payload or payload["enforce_screening"] is None:
+        return True, []
+    v = payload["enforce_screening"]
+    if not isinstance(v, bool):
+        return True, [{"field": "enforce_screening",
+                       "message": "enforce_screening 必须是布尔值（true/false）"}]
+    return v, []
+
+
 def _version_bundle(plan_row, version_row, result: dict) -> dict:
     return {
         "plan_id": plan_row["id"],
@@ -77,11 +109,18 @@ def _version_bundle(plan_row, version_row, result: dict) -> dict:
 def create_plan():
     payload = _parse_json()
     data = _validated(payload)
+    enforce_screening, enforce_errors = _enforce_flag(payload)
+    if enforce_errors:
+        raise ApiError("VALIDATION_FAILED", "入参校验失败，详见 fields", 422, enforce_errors)
 
-    result = build_groups(
-        data["cells"], data["topology"], data["thresholds"], data["rated_capacity_ah"]
-    )
     with _db() as conn:
+        screening_map = _screening_map(conn, data["cells"])
+        result = build_groups(
+            data["cells"], data["topology"], data["thresholds"],
+            data["rated_capacity_ah"],
+            screening_map=screening_map,
+            enforce_screening=enforce_screening,
+        )
         for cell in data["cells"]:
             store.upsert_cell(conn, cell)
         plan_id, version = store.create_plan(
@@ -99,6 +138,9 @@ def create_plan():
 def recompute(plan_id: int):
     payload = _parse_json()
     data = _validated(payload)
+    enforce_screening, enforce_errors = _enforce_flag(payload)
+    if enforce_errors:
+        raise ApiError("VALIDATION_FAILED", "入参校验失败，详见 fields", 422, enforce_errors)
     note = payload.get("note")
 
     with _db() as conn:
@@ -119,9 +161,12 @@ def recompute(plan_id: int):
                 )
         data["topology"] = topology
 
+        screening_map = _screening_map(conn, data["cells"])
         result = build_groups(
             data["cells"], topology, data["thresholds"],
             data["rated_capacity_ah"],
+            screening_map=screening_map,
+            enforce_screening=enforce_screening,
         )
         for cell in data["cells"]:
             store.upsert_cell(conn, cell)
@@ -268,3 +313,118 @@ def get_cell(cell_id: str):
     if row is None:
         raise ApiError("CELL_NOT_FOUND", f"电芯 {cell_id} 无档案", 404)
     return jsonify({k: row[k] for k in row.keys()})
+
+
+# ---------------------------------------------------------------------------
+# 静置复测筛查
+# ---------------------------------------------------------------------------
+
+def _cell_result_view(row) -> dict[str, Any]:
+    """从 result_json 还原逐只筛查结果（已含逐条命中阈值原因与样本明细）。"""
+    return json.loads(row["result_json"])
+
+
+@bp.post("/screenings")
+def create_screening():
+    """创建静置复测筛查批次：温度修正 → 松弛期剔除 → 速率拟合 → 判定并留存。"""
+    payload = _parse_json()
+    data, errors = validate_screening_payload(payload)
+    if errors:
+        raise ApiError("VALIDATION_FAILED", "入参校验失败，详见 fields", 422, errors)
+
+    parameters = data["parameters"]
+    cell_results = [
+        screen_cell(entry["cell_id"], entry["samples"], parameters)
+        for entry in data["cells"]
+    ]
+
+    with _db() as conn:
+        batch_id, created_at = store.create_screening_batch(
+            conn, data["name"], parameters, cell_results
+        )
+        batch_row = store.get_screening_batch(conn, batch_id)
+        cell_rows = store.list_screening_cells(conn, batch_id)
+        results = [_cell_result_view(r) for r in cell_rows]
+
+    return jsonify({
+        "batch_id": batch_id,
+        "name": data["name"],
+        "parameters": parameters,
+        "created_at": batch_row["created_at"],
+        "summary": summarize(results),
+        "cells": results,
+    }), 201
+
+
+@bp.get("/screenings")
+def list_screenings():
+    """筛查批次列表（参数留存、可查询）。"""
+    with _db() as conn:
+        rows = store.list_screening_batches(conn)
+    return jsonify({
+        "batches": [
+            {
+                "batch_id": r["id"],
+                "name": r["name"],
+                "parameters": json.loads(r["parameters"]),
+                "created_at": r["created_at"],
+                "cell_count": r["cell_count"] or 0,
+                "stable_count": r["stable_count"] or 0,
+                "retest_count": r["retest_count"] or 0,
+                "quarantined_count": r["quarantined_count"] or 0,
+            }
+            for r in rows
+        ],
+    })
+
+
+@bp.get("/screenings/<int:batch_id>")
+def get_screening(batch_id: int):
+    """筛查批次详情：参数、逐只电芯结论、拟合结果、逐条命中原因与原始测量。"""
+    with _db() as conn:
+        batch_row = store.get_screening_batch(conn, batch_id)
+        if batch_row is None:
+            raise ApiError("SCREENING_BATCH_NOT_FOUND",
+                           f"筛查批次 {batch_id} 不存在", 404)
+        cell_rows = store.list_screening_cells(conn, batch_id)
+        results = [_cell_result_view(r) for r in cell_rows]
+
+    return jsonify({
+        "batch_id": batch_id,
+        "name": batch_row["name"],
+        "parameters": json.loads(batch_row["parameters"]),
+        "created_at": batch_row["created_at"],
+        "summary": summarize(results),
+        "cells": results,
+    })
+
+
+@bp.get("/cells/<cell_id>/screenings")
+def list_cell_screenings(cell_id: str):
+    """单只电芯的历次筛查结果（按批次倒序）；原始测量随结果返回。"""
+    with _db() as conn:
+        batch_rows = conn.execute(
+            """SELECT sc.batch_id AS batch_id, sc.result_json AS result_json,
+                      b.name AS batch_name, b.created_at AS batch_created_at
+               FROM screening_cells sc
+               JOIN screening_batches b ON b.id = sc.batch_id
+               WHERE sc.cell_id = ?
+               ORDER BY sc.batch_id DESC""",
+            (cell_id,),
+        ).fetchall()
+
+    if not batch_rows:
+        raise ApiError("SCREENING_NOT_FOUND",
+                       f"电芯 {cell_id} 无静置复测筛查记录", 404)
+    return jsonify({
+        "cell_id": cell_id,
+        "screenings": [
+            {
+                "batch_id": r["batch_id"],
+                "batch_name": r["batch_name"],
+                "batch_created_at": r["batch_created_at"],
+                "result": json.loads(r["result_json"]),
+            }
+            for r in batch_rows
+        ],
+    })

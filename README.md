@@ -105,6 +105,71 @@ curl -X POST http://localhost:5000/api/v1/plans \
 （峰值电流最小的包，含原因）。尾料组/未满配组不参与计算，但在 `excluded_groups` 中
 逐条说明跳过原因；该版本没有任何满配成包组时返回 422 `NO_COMPLETE_GROUP`。
 
+### 9. 静置复测筛查 `POST /screenings`
+
+退役电芯初测合格后静置数天仍可能电压回落（自放电/微短路），单次 OCV 无法识别。
+该接口接收每只电芯**多条**带采样时间、OCV、温度的复测，逐只执行：
+
+1. **温度修正**：`OCV_ref = OCV_meas + α × (T_ref − T_meas)`，把每条 OCV 修正到参考温度；
+2. **松弛期剔除**：以首条采样为时间零点，`elapsed < relaxation_hours` 的样本不参与拟合；
+3. **最小观察跨度**：参与拟合样本的首尾时间跨度不足则不能下结论；
+4. **最小二乘拟合**：对 (时间(天), 修正后 OCV) 拟合直线，斜率即补偿后电压变化速率
+   （`slope_v_per_day`，正常自放电为负；`drop_rate_v_per_day = -slope` 为下降速率），
+   并给出拟合优度 `r_squared`（R²）；
+5. **判定**：`STABLE` 稳定 / `RETEST` 待复测 / `QUARANTINE` 隔离，逐条给出命中阈值原因
+   （`code/message/measured/threshold`）。
+
+| 判定 | 触发条件 |
+|---|---|
+| `RETEST` 待复测 | 采样不足 2 条；剔除松弛期后不足 2 条；观察跨度 < 最小观察跨度；R² < 拟合质量阈值 |
+| `QUARANTINE` 隔离 | 拟合可信且观察跨度足够，但下降速率 > 下降速率阈值 |
+| `STABLE` 稳定 | 其余（下降速率等于阈值按不越限处理） |
+
+请求体见 `examples/sample_screening.json`。筛查参数（全部可选，缺省取默认值）：
+
+| 参数 | 含义 | 单位 | 默认 | 范围 |
+|---|---|---|---|---|
+| `relaxation_hours` | 松弛期（首条采样起算，期内样本剔除） | h | 24 | [0, 1e5] |
+| `min_observation_hours` | 松弛期后最小观察跨度 | h | 72 | [0, 1e6] |
+| `reference_temperature_c` | OCV 修正参考温度 T_ref | °C | 25 | [-40, 85] |
+| `temperature_coefficient_v_per_c` | 温度补偿系数 α（允许负值） | V/°C | 0.001 | [-0.01, 0.01] |
+| `max_voltage_drop_v_per_day` | 最大允许电压下降速率 | V/天 | 0.005 | [0, 1] |
+| `min_r_squared` | 线性拟合优度下限 R² | 比例 | 0.90 | [0, 1] |
+
+采样 `cells[].samples[]` 字段：`sampled_at`（ISO 8601，支持 `Z`，无时区按 UTC，
+必须升序、不重复）、`ocv_v`（V，(0, 5]）、`temperature_c`（°C，[-40, 85]）。
+
+响应逐只返回：`sample_count` 样本数、`relaxation_excluded_count` 松弛期剔除数、
+`used_sample_count` 拟合样本数、`observation_hours` 观察跨度、`fit`（补偿后斜率/
+下降速率/截距/R²/拟合用样本数/平均温度）、`verdict`/`verdict_label`、`reasons`
+命中阈值原因，以及逐条 `samples`（含 `elapsed_hours`、`ocv_corrected_v`、
+`used_in_fit`，原始测量原样留存）。
+
+### 10. 筛查批次与历史查询
+
+- `GET /screenings`：批次列表（参数留存 + 各结论计数）；
+- `GET /screenings/{batch_id}`：批次详情（参数、逐只结论、拟合、命中原因、原始测量）；
+- `GET /cells/{cell_id}/screenings`：单只电芯历次筛查（批次倒序，便于看稳定→隔离的变化）。
+
+筛查数据**只追加**：新筛查生成新批次，绝不改写历史批次、原始测量，也不回写已保存的
+方案版本。
+
+### 11. 筛查门禁如何影响创建/重算配组
+
+`POST /plans` 与 `POST /plans/{plan_id}/recompute` 在装箱前自动查询每只电芯**最新批次**
+筛查结论：
+
+- 最新为 `QUARANTINE`：**默认拒绝**，不进入任何组（含尾料池），在结果
+  `screening_gate.rejected_quarantined` 中逐只留痕（含批次号与拟合指标）；
+- 最新为 `RETEST`：允许成包，但所在组风险附 `SCREENING_RETEST_PENDING` 原因
+  （组级风险，含电芯编号），指标 `screening_retest_count` 计数；
+- `STABLE` / 从未筛查：正常放行（未筛查电芯在 `unscreened_cell_ids` 留痕，不阻断）。
+
+可选请求字段 `enforce_screening`（布尔，默认 `true`）：置 `false` 时隔离电芯不被拒绝，
+仅在 `warned_quarantined` 告警，且所在组风险兜底为 `SCREENING_QUARANTINED_CELL` /
+CRITICAL，供审计场景使用。门禁结果与逐只电芯筛查快照固化进版本 `result_json`；
+**之后的新筛查不改变已保存版本**，只影响下一次创建/重算。
+
 ## 评估模型说明
 
 - **配组算法**：按容量升序、内阻次序贪心装箱；逐只试加入当前组，要求加入后
@@ -125,6 +190,10 @@ curl -X POST http://localhost:5000/api/v1/plans \
   每条原因带 `code / message / measured / threshold`。
 - **可替换候选**：从所有未入组电芯中，筛选“换入后 CV 仍不越限”的电芯，
   按到组中心（容量、内阻归一化距离）排序，最多返回 5 只及换入后的预测 CV。
+- **静置复测门禁**：创建/重算时取每只电芯最新筛查批次结论。隔离电芯默认拒绝
+  （不入任何组，`summary.submitted_cells` 为提交数、`total_cells` 为通过门禁数）；
+  待复测电芯可成包但组级附 `SCREENING_RETEST_PENDING` 风险；结果 `screening_gate`
+  记录拒绝/待复测/稳定/未筛查明细并随版本快照固化。
 
 ## 错误响应（定位到字段）
 
@@ -144,7 +213,8 @@ curl -X POST http://localhost:5000/api/v1/plans \
 
 错误码：`INVALID_CONTENT_TYPE` 400、`INVALID_JSON` 400、`VALIDATION_FAILED` 422、
 `TOPOLOGY_CONFLICT` 422、`NO_COMPLETE_GROUP` 422、`PLAN_NOT_FOUND` 404、
-`VERSION_NOT_FOUND` 404、`CELL_NOT_FOUND` 404、`MISSING_QUERY` 400。
+`VERSION_NOT_FOUND` 404、`CELL_NOT_FOUND` 404、`SCREENING_BATCH_NOT_FOUND` 404、
+`SCREENING_NOT_FOUND` 404、`MISSING_QUERY` 400。
 
 ## 测试
 
@@ -157,13 +227,15 @@ python -m pytest tests/ -q
 ```
 app/
   __init__.py    # 应用工厂
-  validation.py  # 字段/单位/范围/拓扑/阈值校验（含负载校核入参）
-  grouping.py    # 装箱、指标、风险评分、最弱电芯、替换候选
+  validation.py  # 字段/单位/范围/拓扑/阈值校验（含负载校核、静置复测入参）
+  grouping.py    # 装箱、指标、风险评分、最弱电芯、替换候选、筛查门禁
+  screening.py   # 静置复测：OCV 温度修正、松弛期剔除、速率拟合、稳定/待复测/隔离判定
   load_check.py  # 版本快照脉冲放电压降/损耗/容量余量逐步校核
   diff.py        # 两版结构化差异
-  db.py          # SQLite 表结构与版本持久化
+  db.py          # SQLite 表结构与版本/筛查批次持久化
   routes.py      # HTTP 路由与字段级错误
 examples/sample_plan.json
+examples/sample_screening.json
 tests/           # pytest 端到端用例
 run.py
 ```

@@ -1,0 +1,33 @@
+{
+  "name": "2026-09-A批次-静置复测",
+  "parameters": {
+    "relaxation_hours": 24.0,
+    "min_observation_hours": 72.0,
+    "reference_temperature_c": 25.0,
+    "temperature_coefficient_v_per_c": 0.001,
+    "max_voltage_drop_v_per_day": 0.005,
+    "min_r_squared": 0.90
+  },
+  "cells": [
+    {
+      "cell_id": "A-0001",
+      "samples": [
+        {"sampled_at": "2026-09-01T08:00:00Z", "ocv_v": 3.205, "temperature_c": 25.1},
+        {"sampled_at": "2026-09-02T08:00:00Z", "ocv_v": 3.203, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-03T08:00:00Z", "ocv_v": 3.201, "temperature_c": 25.2},
+        {"sampled_at": "2026-09-04T08:00:00Z", "ocv_v": 3.199, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-05T08:00:00Z", "ocv_v": 3.197, "temperature_c": 25.1}
+      ]
+    },
+    {
+      "cell_id": "A-0002",
+      "samples": [
+        {"sampled_at": "2026-09-01T08:00:00Z", "ocv_v": 3.206, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-02T08:00:00Z", "ocv_v": 3.196, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-03T08:00:00Z", "ocv_v": 3.186, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-04T08:00:00Z", "ocv_v": 3.176, "temperature_c": 25.0},
+        {"sampled_at": "2026-09-05T08:00:00Z", "ocv_v": 3.166, "temperature_c": 25.0}
+      ]
+    }
+  ]
+}
