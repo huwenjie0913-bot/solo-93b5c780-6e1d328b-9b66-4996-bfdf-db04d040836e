@@ -9,7 +9,8 @@ from flask import Blueprint, current_app, jsonify, request
 from . import db as store
 from .diff import diff_results
 from .grouping import build_groups
-from .validation import validate_payload
+from .load_check import check_version_load
+from .validation import validate_load_check, validate_payload
 
 bp = Blueprint("api", __name__, url_prefix="/api/v1")
 
@@ -214,6 +215,50 @@ def export_version(plan_id: int, version: int):
         f'attachment; filename="plan_{plan_id}_v{version}.json"'
     )
     return response
+
+
+@bp.post("/plans/<int:plan_id>/versions/<int:version>/load-check")
+def load_check(plan_id: int, version: int):
+    """版本级负载校核：对已保存版本快照逐步计算脉冲放电压降/损耗/容量余量。"""
+    payload = _parse_json()
+    cleaned, errors = validate_load_check(payload)
+    if errors:
+        raise ApiError("VALIDATION_FAILED", "入参校验失败，详见 fields", 422, errors)
+
+    with _db() as conn:
+        plan_row = store.get_plan(conn, plan_id)
+        if plan_row is None:
+            raise ApiError("PLAN_NOT_FOUND", f"方案 {plan_id} 不存在", 404)
+        version_row = store.get_version(conn, plan_id, version)
+        if version_row is None:
+            raise ApiError("VERSION_NOT_FOUND",
+                           f"方案 {plan_id} 不存在版本 {version}", 404)
+        version_result = json.loads(version_row["result_json"])
+
+    complete_groups = [g for g in version_result["groups"] if g.get("complete")]
+    if not complete_groups:
+        raise ApiError(
+            "NO_COMPLETE_GROUP",
+            f"方案 {plan_id} 版本 {version} 中没有满配成包组，"
+            f"仅有尾料/未满配组，无法按完整电池组执行负载校核",
+            422,
+            [{"field": "version",
+              "message": "该版本不存在可构成完整串并联拓扑的电池组"}],
+        )
+
+    check = check_version_load(
+        version_result,
+        cleaned["steps"],
+        cleaned["min_terminal_voltage_v"],
+        cleaned["max_loss_power_w"],
+    )
+    return jsonify({
+        "plan_id": plan_id,
+        "plan_name": plan_row["name"],
+        "version": version,
+        "topology": json.loads(plan_row["topology"]),
+        "load_check": check,
+    }), 200
 
 
 @bp.get("/cells/<cell_id>")

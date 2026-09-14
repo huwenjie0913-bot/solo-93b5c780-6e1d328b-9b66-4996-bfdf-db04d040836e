@@ -6,9 +6,14 @@
 - ocv_v         开路电压，伏 (V)
 - cycles        循环次数，次
 - temperature_c 测试温度，摄氏度 (°C)
+
+负载校核接口（steps 放电步骤）的单位：
+- current_a     放电电流，安 (A)，不允许负值
+- duration_s    持续时间，秒 (s)，必须为正
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -200,4 +205,97 @@ def validate_payload(payload: Any, rated_capacity_ah: float) -> tuple[dict | Non
         "thresholds": thresholds,
         "rated_capacity_ah": float(rated_capacity_ah),
         "name": name.strip() if isinstance(name, str) and name.strip() else None,
+    }, []
+
+
+def validate_load_check(payload: Any) -> tuple[dict | None, list[dict]]:
+    """校验版本级负载校核接口请求体。
+
+    字段：
+    - steps: 非空数组，元素含 current_a（放电电流 A，>=0）与
+      duration_s（持续时间 s，>0）；
+    - min_terminal_voltage_v: 最低包端电压 V，必填，(0, 100000]；
+    - max_loss_power_w: 最大损耗功率 W，必填，(0, 1e9]。
+
+    返回 ``({"steps": [...], "min_terminal_voltage_v": float,
+    "max_loss_power_w": float}, errors)``。
+    """
+    errors: list[dict] = []
+    steps: list[dict[str, float]] = []
+
+    if not isinstance(payload, dict):
+        return None, [{"field": "$", "message": "请求体必须是 JSON 对象"}]
+
+    steps_raw = payload.get("steps")
+    if steps_raw is None:
+        errors.append({"field": "steps", "message": "缺少放电步骤列表 steps"})
+    elif not isinstance(steps_raw, list) or not steps_raw:
+        errors.append({"field": "steps", "message": "steps 必须是非空数组"})
+    else:
+        for i, raw_step in enumerate(steps_raw):
+            prefix = f"steps[{i}]"
+            if not isinstance(raw_step, dict):
+                errors.append({"field": prefix, "message": "放电步骤必须是对象"})
+                continue
+
+            current = raw_step.get("current_a")
+            if current is None:
+                errors.append({"field": f"{prefix}.current_a",
+                               "message": "放电电流缺失（单位：A）"})
+            elif not _is_number(current) or not math.isfinite(float(current)):
+                errors.append({"field": f"{prefix}.current_a",
+                               "message": "放电电流必须是有限数字，单位 A"})
+            elif float(current) < 0:
+                errors.append({"field": f"{prefix}.current_a",
+                               "message": f"放电电流={float(current)} A 不能为负值"})
+
+            duration = raw_step.get("duration_s")
+            if duration is None:
+                errors.append({"field": f"{prefix}.duration_s",
+                               "message": "持续时间缺失（单位：s）"})
+            elif not _is_number(duration) or not math.isfinite(float(duration)):
+                errors.append({"field": f"{prefix}.duration_s",
+                               "message": "持续时间必须是有限数字，单位 s"})
+            elif float(duration) <= 0:
+                errors.append({"field": f"{prefix}.duration_s",
+                               "message": f"持续时间={float(duration)} s 必须大于 0"})
+
+            if (current is not None and _is_number(current)
+                    and math.isfinite(float(current)) and float(current) >= 0
+                    and duration is not None and _is_number(duration)
+                    and math.isfinite(float(duration)) and float(duration) > 0):
+                steps.append({
+                    "current_a": float(current),
+                    "duration_s": float(duration),
+                })
+
+    min_v = payload.get("min_terminal_voltage_v")
+    if min_v is None:
+        errors.append({"field": "min_terminal_voltage_v",
+                       "message": "缺少最低包端电压限制（单位：V）"})
+    elif not _is_number(min_v) or not math.isfinite(float(min_v)):
+        errors.append({"field": "min_terminal_voltage_v",
+                       "message": "最低包端电压必须是有限数字，单位 V"})
+    elif not (0.0 < float(min_v) <= 100000.0):
+        errors.append({"field": "min_terminal_voltage_v",
+                       "message": f"最低包端电压={float(min_v)} V 超出范围 (0, 100000] V"})
+
+    max_p = payload.get("max_loss_power_w")
+    if max_p is None:
+        errors.append({"field": "max_loss_power_w",
+                       "message": "缺少最大损耗功率限制（单位：W）"})
+    elif not _is_number(max_p) or not math.isfinite(float(max_p)):
+        errors.append({"field": "max_loss_power_w",
+                       "message": "最大损耗功率必须是有限数字，单位 W"})
+    elif not (0.0 < float(max_p) <= 1e9):
+        errors.append({"field": "max_loss_power_w",
+                       "message": f"最大损耗功率={float(max_p)} W 超出范围 (0, 1e9] W"})
+
+    if errors:
+        return None, errors
+
+    return {
+        "steps": steps,
+        "min_terminal_voltage_v": float(min_v),
+        "max_loss_power_w": float(max_p),
     }, []

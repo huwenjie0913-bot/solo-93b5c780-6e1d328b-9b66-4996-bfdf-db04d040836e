@@ -72,6 +72,39 @@ curl -X POST http://localhost:5000/api/v1/plans \
 
 ### 7. 电芯档案 `GET /cells/{cell_id}` · 健康检查 `GET /health`
 
+### 8. 版本级负载校核 `POST /plans/{plan_id}/versions/{version}/load-check`
+
+静态指标合格的配组装到设备后，仍可能在脉冲放电时跌破电压下限。该接口对**已保存的
+版本快照**（开路电压、串并联拓扑、并联串内阻、可用容量）逐步计算整包放电响应，不改动版本：
+
+- V端 = V开路 − I×R（V开路取最低单体 OCV × 串联数，R 取各并联串内阻之和，mΩ 换算为 Ω）
+- P损 = I²R；累计 Ah = Σ I×t/3600；容量余量 = 整包可用容量 − 累计 Ah
+
+```json
+{
+  "steps": [
+    {"current_a": 30, "duration_s": 10},
+    {"current_a": 90, "duration_s": 30}
+  ],
+  "min_terminal_voltage_v": 24.0,
+  "max_loss_power_w": 120.0
+}
+```
+
+| 字段 | 含义 | 单位 | 约束 |
+|---|---|---|---|
+| `steps` | 放电步骤（电流+持续时间） | — | 非空数组 |
+| `steps[].current_a` | 放电电流 | A | 数字，≥0（负值拒绝；0 为静置步骤） |
+| `steps[].duration_s` | 持续时间 | s | 数字，>0（零时长拒绝） |
+| `min_terminal_voltage_v` | 最低包端电压 | V | 必填，(0, 100000] |
+| `max_loss_power_w` | 最大损耗功率 | W | 必填，(0, 1e9] |
+
+响应按**完整电池组**逐组返回每步压降/端电压/损耗功率/本步与累计 Ah/容量余量及该步越限
+原因；给出全局首个越限点（最早步骤，组顺序裁决）、各组可承受峰值电流
+`min((V开路−V下限)/R, √(P上限/R))` 及其限制来源，并汇总整批可承受峰值电流与最弱组
+（峰值电流最小的包，含原因）。尾料组/未满配组不参与计算，但在 `excluded_groups` 中
+逐条说明跳过原因；该版本没有任何满配成包组时返回 422 `NO_COMPLETE_GROUP`。
+
 ## 评估模型说明
 
 - **配组算法**：按容量升序、内阻次序贪心装箱；逐只试加入当前组，要求加入后
@@ -110,8 +143,8 @@ curl -X POST http://localhost:5000/api/v1/plans \
 ```
 
 错误码：`INVALID_CONTENT_TYPE` 400、`INVALID_JSON` 400、`VALIDATION_FAILED` 422、
-`TOPOLOGY_CONFLICT` 422、`PLAN_NOT_FOUND` 404、`VERSION_NOT_FOUND` 404、
-`CELL_NOT_FOUND` 404、`MISSING_QUERY` 400。
+`TOPOLOGY_CONFLICT` 422、`NO_COMPLETE_GROUP` 422、`PLAN_NOT_FOUND` 404、
+`VERSION_NOT_FOUND` 404、`CELL_NOT_FOUND` 404、`MISSING_QUERY` 400。
 
 ## 测试
 
@@ -124,12 +157,13 @@ python -m pytest tests/ -q
 ```
 app/
   __init__.py    # 应用工厂
-  validation.py  # 字段/单位/范围/拓扑/阈值校验
+  validation.py  # 字段/单位/范围/拓扑/阈值校验（含负载校核入参）
   grouping.py    # 装箱、指标、风险评分、最弱电芯、替换候选
+  load_check.py  # 版本快照脉冲放电压降/损耗/容量余量逐步校核
   diff.py        # 两版结构化差异
   db.py          # SQLite 表结构与版本持久化
   routes.py      # HTTP 路由与字段级错误
 examples/sample_plan.json
-tests/           # pytest 端到端用例（12 项）
+tests/           # pytest 端到端用例
 run.py
 ```
